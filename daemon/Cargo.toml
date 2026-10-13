@@ -1,0 +1,20 @@
+[package]
+name = "ncm-castd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local cast daemon: JSON-RPC + SSE front-end for cast-engine"
+
+[dependencies]
+cast-engine = { path = "../engine" }
+anyhow = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http_dh = "0.12.2"
+base64 = "0.22"
+ureq = { version = "3.4.2", default-features = false, features = [
+    "rustls",
+    "gzip",
+    "charset",
+] }

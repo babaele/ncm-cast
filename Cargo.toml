@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["engine", "daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["babaele"]
+
+[profile.release]
+strip = true
+codegen-units = 1
+lto = "thin"

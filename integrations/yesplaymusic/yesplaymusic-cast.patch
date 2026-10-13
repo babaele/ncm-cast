@@ -1,0 +1,815 @@
+diff --git a/src/App.vue b/src/App.vue
+index 59392be..98de10a 100644
+--- a/src/App.vue
++++ b/src/App.vue
+@@ -16,6 +16,7 @@
+       <Player v-if="enablePlayer" v-show="showPlayer" ref="player" />
+     </transition>
+     <Toast />
++    <CastDevices />
+     <ModalAddTrackToPlaylist v-if="isAccountLoggedIn" />
+     <ModalNewPlaylist v-if="isAccountLoggedIn" />
+     <transition v-if="enablePlayer" name="slide-up">
+@@ -31,6 +32,7 @@ import Scrollbar from './components/Scrollbar.vue';
+ import Navbar from './components/Navbar.vue';
+ import Player from './components/Player.vue';
+ import Toast from './components/Toast.vue';
++import CastDevices from './components/CastDevices.vue';
+ import { ipcRenderer } from './electron/ipcRenderer';
+ import { isAccountLoggedIn, isLooseLoggedIn } from '@/utils/auth';
+ import Lyrics from './views/lyrics.vue';
+@@ -42,6 +44,7 @@ export default {
+     Navbar,
+     Player,
+     Toast,
++    CastDevices,
+     ModalAddTrackToPlaylist,
+     ModalNewPlaylist,
+     Lyrics,
+diff --git a/src/assets/icons/cast.svg b/src/assets/icons/cast.svg
+new file mode 100644
+index 0000000..02810f9
+--- /dev/null
++++ b/src/assets/icons/cast.svg
+@@ -0,0 +1 @@
++<svg aria-hidden="true" focusable="false" data-prefix="fas" data-icon="cast" role="img" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512" class="svg-inline--fa fa-cast fa-w-20 fa-9x"><path fill="currentColor" d="M576 32H64A64 64 0 0 0 0 96v224a64 64 0 0 0 64 64h64v-48H64a16 16 0 0 1-16-16V96a16 16 0 0 1 16-16h512a16 16 0 0 1 16 16v224a16 16 0 0 1-16 16h-64v48h64a64 64 0 0 0 64-64V96a64 64 0 0 0-64-64zM32 448a32 32 0 1 0 32 32 32 32 0 0 0-32-32zm96 0a48 48 0 0 0-48 48 16 16 0 0 1-16 16 16 16 0 0 1-16-16 80 80 0 0 1 80-80 16 16 0 0 1 16 16 16 16 0 0 1-16 16zm96 0a144 144 0 0 0-96 41.94A16 16 0 0 1 96 464a176 176 0 0 1 128-52.81 16 16 0 0 1 0 36.81z" class=""></path></svg>
+diff --git a/src/background.js b/src/background.js
+index 612f877..1765fbc 100644
+--- a/src/background.js
++++ b/src/background.js
+@@ -19,6 +19,7 @@ import {
+ } from '@/utils/platform';
+ import { createProtocol } from 'vue-cli-plugin-electron-builder/lib';
+ import { startNeteaseMusicApi } from './electron/services';
++import { startCastService, stopCastService } from './electron/castService';
+ import { initIpcMain } from './electron/ipcMain.js';
+ import { createMenu } from './electron/menu';
+ import { createTray } from '@/electron/tray';
+@@ -107,6 +108,9 @@ class Background {
+     // start netease music api
+     this.neteaseMusicAPI = startNeteaseMusicApi();
+ 
++    // start the DLNA/AirPlay/HEOS/QPlay push daemon (best effort)
++    this.castService = startCastService();
++
+     // create Express app
+     this.createExpressApp();
+ 
+@@ -474,6 +478,8 @@ class Background {
+     app.on('will-quit', () => {
+       // unregister all global shortcuts
+       globalShortcut.unregisterAll();
++      // stop the push daemon
++      stopCastService();
+     });
+ 
+     if (!isMac) {
+diff --git a/src/components/CastDevices.vue b/src/components/CastDevices.vue
+new file mode 100644
+index 0000000..60bceb7
+--- /dev/null
++++ b/src/components/CastDevices.vue
+@@ -0,0 +1,373 @@
++<template>
++  <div v-if="castState.open" class="cast-panel" @click.stop>
++    <div class="cast-head">
++      <span class="title">推送到设备</span>
++      <div>
++        <button class="link" :disabled="busy" @click="doRefresh">
++          {{ busy ? '搜索中…' : '重新搜索' }}
++        </button>
++        <button class="link close" @click="castState.open = false">✕</button>
++      </div>
++    </div>
++
++    <div class="cast-opts">
++      <label>
++        <input type="checkbox" v-model="castState.auto" />
++        跟随播放自动推送
++      </label>
++      <label>
++        <input type="checkbox" v-model="muteLocal" />
++        推送时静音本地
++      </label>
++      <select v-model="castState.quality" title="推送音质">
++        <option value="standard">标准</option>
++        <option value="exhigh">极高</option>
++        <option value="lossless">无损 FLAC</option>
++        <option value="hires">Hi-Res</option>
++      </select>
++    </div>
++
++    <div class="cast-opts">
++      <label :title="directHint">
++        <input type="checkbox" :checked="castState.direct" @change="toggleDirect" />
++        直连模式（设备直接取网易 CDN）
++      </label>
++    </div>
++
++    <p v-if="castState.error" class="err">{{ castState.error }}</p>
++
++    <ul v-if="castState.devices.length" class="devices">
++      <li
++        v-for="d in castState.devices"
++        :key="d.id"
++        :class="{ selected: isOn(d.id), active: castState.active[d.id] }"
++      >
++        <label class="row">
++          <input
++            type="checkbox"
++            :value="d.id"
++            v-model="castState.selected"
++            @change="onSelect(d.id)"
++          />
++          <span class="proto" :title="d.protocol">{{ protoLabel(d.protocol) }}</span>
++          <span class="name">{{ d.name }}</span>
++          <span v-if="d.model" class="model">{{ d.model }}</span>
++          <span v-if="!d.caps.lossless_passthrough" class="tag">转码</span>
++          <span v-if="d.caps.native_group" class="tag green">原生同步</span>
++        </label>
++
++        <div v-if="isOn(d.id)" class="controls">
++          <button @click="castOne(d.id)">推送当前歌曲</button>
++          <button @click="pause(d.id)">暂停</button>
++          <button @click="resume(d.id)">继续</button>
++          <button @click="stop(d.id)">停止</button>
++          <input
++            type="range"
++            min="0"
++            max="100"
++            :value="vol[d.id] ?? 50"
++            @change="setVolume(d.id, $event.target.value)"
++          />
++        </div>
++      </li>
++    </ul>
++    <p v-else class="empty">
++      没有找到设备 — 确认音箱/播放器与电脑在同一局域网，且 ncm-castd 已启动。
++    </p>
++
++    <div v-if="castState.selected.length > 1" class="group">
++      <button @click="makeGroup">多设备同步播放</button>
++      <span v-if="castState.nativeSync" class="hint">
++        该协议原生支持分组（HEOS），同步由设备自己保证。
++      </span>
++      <span v-else class="hint">软件同步：每 5 秒校正一次漂移。</span>
++    </div>
++  </div>
++</template>
++
++<script>
++import * as cast from '@/utils/cast';
++import { mapState } from 'vuex';
++
++export default {
++  name: 'CastDevices',
++  data() {
++    return {
++      castState: cast.castState,
++      busy: false,
++      vol: {},
++      muteLocal: false,
++      savedVolume: null,
++      unsubscribe: null,
++    };
++  },
++  computed: {
++    ...mapState(['player']),
++    currentTrack() {
++      return this.player.currentTrack;
++    },
++    trackID() {
++      return this.currentTrack?.id ?? 0;
++    },
++    directHint() {
++      return this.castState.direct
++        ? '设备直接向网易 CDN 取流，不需要连回本机。当前：直连。'
++        : '设备向本机网关取流（音质更稳、支持 Range 与需登录的曲目）。'
++          + '若设备能发现、能连接但始终没有声音（防火墙 / 360 局域网隐身 / 路由器 AP 隔离），'
++          + '勾选此项即可。';
++    },
++  },
++  watch: {
++    // "跟随播放自动推送": mirror whatever the player starts playing.
++    trackID() {
++      if (!this.castState.auto || !this.castState.selected.length) return;
++      if (!this.currentTrack?.name) return;
++      this.pushAll();
++    },
++    muteLocal(on) {
++      if (!on) return;
++      if (this.savedVolume === null) this.savedVolume = this.player.volume;
++      this.player.volume = 0;
++    },
++  },
++  async created() {
++    await this.syncCookie();
++  },
++  async mounted() {
++    await this.doRefresh();
++    this.unsubscribe = cast.subscribe(e => {
++      if (e.type === 'status') {
++        this.$set(this.castState.active, e.id, e.status?.state === 'playing');
++      }
++      if (e.type === 'device_found') {
++        if (!this.castState.devices.some(d => d.id === e.device.id))
++          this.castState.devices.push(e.device);
++      }
++      if (e.type === 'device_lost') {
++        this.castState.devices = this.castState.devices.filter(
++          d => d.id !== e.id
++        );
++        this.castState.selected = this.castState.selected.filter(
++          id => id !== e.id
++        );
++      }
++    });
++  },
++  beforeDestroy() {
++    if (this.unsubscribe) this.unsubscribe();
++    if (this.savedVolume !== null) this.player.volume = this.savedVolume;
++  },
++  methods: {
++    protoLabel: cast.protoLabel,
++    isOn(id) {
++      return this.castState.selected.includes(id);
++    },
++    /**
++     * Direct mode is the escape hatch for "everything works but there is no
++     * sound": the renderer then fetches NetEase's CDN itself and never has to
++     * open a connection back to this PC.
++     */
++    async toggleDirect(e) {
++      try {
++        await cast.setDirect(e.target.checked);
++      } catch (err) {
++        this.castState.error = `切换直连模式失败：${err.message}`;
++      }
++    },
++    /** Give the daemon the cookie YPM already holds, so it can sign URLs. */
++    async syncCookie() {
++      try {
++        await cast.pushCookie();
++      } catch {
++        /* not logged in, or daemon down — the push button will report it */
++      }
++    },
++    async doRefresh() {
++      this.busy = true;
++      this.castState.error = '';
++      try {
++        await cast.refresh();
++      } catch (e) {
++        // Say it plainly instead of failing silently.
++        this.castState.error = `无法连接推送服务（ncm-castd）：${e.message}`;
++      } finally {
++        this.busy = false;
++      }
++    },
++    async onSelect(id) {
++      try {
++        if (this.isOn(id)) await cast.connect(id);
++        else await cast.disconnect(id);
++      } catch (e) {
++        this.castState.error = e.message;
++      }
++    },
++    pushAll() {
++      return cast.play(
++        this.castState.selected,
++        cast.toTrack(this.currentTrack)
++      );
++    },
++    async castOne(id) {
++      if (!this.currentTrack?.name) return;
++      try {
++        await cast.play([id], cast.toTrack(this.currentTrack));
++      } catch (e) {
++        this.castState.error = e.message;
++      }
++    },
++    async pause(id) {
++      await cast.pause(id);
++    },
++    async resume(id) {
++      await cast.resume(id);
++    },
++    async stop(id) {
++      await cast.stop(id);
++      this.$set(this.castState.active, id, false);
++    },
++    async setVolume(id, v) {
++      this.$set(this.vol, id, Number(v));
++      await cast.volume(id, Number(v));
++    },
++    async makeGroup() {
++      try {
++        await cast.group(this.castState.selected);
++      } catch (e) {
++        this.castState.error = e.message;
++      }
++    },
++  },
++};
++</script>
++
++<style lang="scss" scoped>
++.cast-panel {
++  position: fixed;
++  right: 16px;
++  bottom: 92px;
++  z-index: 1000;
++  width: 380px;
++  max-height: 60vh;
++  overflow-y: auto;
++  padding: 14px 16px;
++  border-radius: 12px;
++  background: var(--color-body-bg, #fff);
++  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
++  color: var(--color-text);
++  font-size: 14px;
++}
++
++.cast-head {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  margin-bottom: 10px;
++
++  .title {
++    font-weight: 700;
++  }
++}
++
++.cast-opts {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  margin-bottom: 10px;
++  font-size: 12px;
++  opacity: 0.85;
++
++  label {
++    display: flex;
++    align-items: center;
++    gap: 4px;
++    cursor: pointer;
++  }
++}
++
++.devices {
++  list-style: none;
++  padding: 0;
++  margin: 0;
++}
++
++.devices li {
++  padding: 6px 0;
++  border-bottom: 1px solid var(--color-secondary-bg, #eee);
++}
++
++.devices li.active .name {
++  font-weight: 700;
++}
++
++.row {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  cursor: pointer;
++}
++
++.proto {
++  font-size: 11px;
++  padding: 1px 6px;
++  border-radius: 4px;
++  background: var(--color-primary-bg, #eef);
++  color: var(--color-primary, #335eea);
++}
++
++.model,
++.tag {
++  font-size: 11px;
++  opacity: 0.6;
++}
++
++.tag.green {
++  color: #3a3;
++  opacity: 1;
++}
++
++.controls {
++  display: flex;
++  gap: 6px;
++  align-items: center;
++  margin: 6px 0 0 22px;
++}
++
++.controls button {
++  font-size: 12px;
++}
++
++.group {
++  margin-top: 10px;
++}
++
++.hint {
++  font-size: 12px;
++  opacity: 0.7;
++  margin-left: 8px;
++}
++
++button.link {
++  background: none;
++  border: none;
++  color: var(--color-primary, #335eea);
++  cursor: pointer;
++  font-size: 12px;
++  padding: 2px 4px;
++}
++
++button.link.close {
++  color: var(--color-text);
++  opacity: 0.6;
++}
++
++.err {
++  color: #d33;
++  font-size: 12px;
++}
++
++.empty {
++  font-size: 12px;
++  opacity: 0.7;
++}
++</style>
+diff --git a/src/components/Player.vue b/src/components/Player.vue
+index c6128e0..713e44a 100644
+--- a/src/components/Player.vue
++++ b/src/components/Player.vue
+@@ -144,6 +144,12 @@
+             @click.native="switchReversed"
+             ><svg-icon icon-class="sort-up"
+           /></button-icon>
++          <button-icon
++            :class="{ active: castState.selected.length > 0 }"
++            title="推送到设备（DLNA / AirPlay / HEOS / QPlay）"
++            @click.native="toggleCast"
++            ><svg-icon icon-class="cast"
++          /></button-icon>
+           <div class="volume-control">
+             <button-icon :title="$t('player.mute')" @click.native="mute">
+               <svg-icon v-show="volume > 0.5" icon-class="volume" />
+@@ -188,6 +194,7 @@ import ButtonIcon from '@/components/ButtonIcon.vue';
+ import VueSlider from 'vue-slider-component';
+ import { goToListSource, hasListSource } from '@/utils/playList';
+ import { formatTrackTime } from '@/utils/common';
++import { castState } from '@/utils/cast';
+ 
+ export default {
+   name: 'Player',
+@@ -198,6 +205,7 @@ export default {
+   data() {
+     return {
+       mouseDownTarget: null,
++      castState,
+     };
+   },
+   computed: {
+@@ -232,6 +240,9 @@ export default {
+   methods: {
+     ...mapMutations(['toggleLyrics']),
+     ...mapActions(['showToast', 'likeATrack']),
++    toggleCast() {
++      castState.open = !castState.open;
++    },
+     handleClick(event) {
+       if (event.target == this.mouseDownTarget) {
+         this.toggleLyrics();
+diff --git a/src/electron/castService.js b/src/electron/castService.js
+new file mode 100644
+index 0000000..9ee716f
+--- /dev/null
++++ b/src/electron/castService.js
+@@ -0,0 +1,107 @@
++// Starts and stops the `ncm-castd` daemon that carries the push protocols.
++//
++// Modelled on `src/electron/services.js` (which starts the bundled NetEase API
++// server on 10754): the daemon is a plain child process on 127.0.0.1:9100, so a
++// failure here must never stop the player from starting.
++
++import { app } from 'electron';
++import { spawn } from 'child_process';
++import path from 'path';
++import fs from 'fs';
++
++const clc = require('cli-color');
++const log = text => {
++  console.log(`${clc.magentaBright('[ncm-cast]')} ${text}`);
++};
++
++export const CAST_PORT = 9100;
++
++/** Everywhere the binary might reasonably be, in priority order. */
++function candidatePaths() {
++  const exe = process.platform === 'win32' ? 'ncm-castd.exe' : 'ncm-castd';
++  const roots = [
++    process.env.NCM_CASTD_PATH, // explicit override, dev or custom install
++    process.resourcesPath && path.join(process.resourcesPath, exe), // packaged
++    path.join(app.getAppPath(), 'bin', exe), // dev: <project>/bin
++    path.join(__dirname, '..', '..', 'bin', exe), // dev fallback
++    path.join(process.cwd(), 'bin', exe),
++  ];
++  return roots.filter(Boolean);
++}
++
++function resolveBinary() {
++  for (const p of candidatePaths()) {
++    try {
++      if (fs.existsSync(p)) return p;
++    } catch {
++      /* ignore unreadable paths */
++    }
++  }
++  return null;
++}
++
++let daemon = null;
++
++export function startCastService() {
++  const bin = resolveBinary();
++  if (!bin) {
++    // Not an error worth blocking over: the UI shows "推送服务未启动" instead.
++    log(
++      `ncm-castd 未找到，已跳过推送服务。将 ncm-castd 放到 ${path.join(
++        app.getAppPath(),
++        'bin'
++      )} 或设置 NCM_CASTD_PATH。`
++    );
++    return null;
++  }
++
++  const cookieFile = path.join(app.getPath('userData'), 'ncm-cast-cookie.txt');
++
++  const args = ['--port', String(CAST_PORT), '--cookie-file', cookieFile];
++
++  // Direct mode: hand the renderer the NetEase CDN URL instead of our local
++  // gateway. Needed on LANs where the renderer can't reach the PC (AP
++  // isolation, third-party firewalls such as 360 LAN protection) — there
++  // gateway mode reports success but nothing plays. Default ON; set
++  // NCM_CAST_DIRECT=0 to fall back to the local proxy.
++  if (process.env.NCM_CAST_DIRECT !== '0') {
++    args.push('--direct');
++  }
++
++  // The LAN address advertised to renderers. Only relevant in gateway mode
++  // (the device fetches from us); set it when the PC has several NICs or
++  // auto-detection picks the wrong one.
++  if (process.env.NCM_CAST_HOST) {
++    args.push('--host', process.env.NCM_CAST_HOST);
++  }
++
++  log(`starting ${bin} on 127.0.0.1:${CAST_PORT}${args.includes('--direct') ? ' (direct mode)' : ''}`);
++  daemon = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
++
++  daemon.stdout.on('data', d => log(String(d).trim()));
++  daemon.stderr.on('data', d => log(String(d).trim()));
++  daemon.on('error', err => log(`failed to start: ${err.message}`));
++  daemon.on('exit', (code, signal) => {
++    log(`exited (code=${code} signal=${signal})`);
++    daemon = null;
++  });
++
++  // Never let a crashed daemon keep the app alive, and never leave it orphaned.
++  daemon.unref?.();
++  return daemon;
++}
++
++export function stopCastService() {
++  if (!daemon) return;
++  log('stopping');
++  try {
++    daemon.kill();
++  } catch {
++    /* already gone */
++  }
++  daemon = null;
++}
++
++export function isCastServiceRunning() {
++  return Boolean(daemon);
++}
+diff --git a/src/utils/cast.js b/src/utils/cast.js
+new file mode 100644
+index 0000000..8b21397
+--- /dev/null
++++ b/src/utils/cast.js
+@@ -0,0 +1,188 @@
++// ncm-cast client — talks to the local `ncm-castd` daemon over plain HTTP.
++//
++// No IPC and no native module: the daemon owns one port and the renderer just
++// fetches it. Drop this file in as `src/utils/cast.js`.
++//
++// The daemon is the same one YesPlayMusic already uses for its NetEase API —
++// it lives next to it as a third local service (YPM: 10754 + 27232, cast: 9100).
++
++import Vue from 'vue';
++
++const BASE = process.env.VUE_APP_CAST_URL || 'http://127.0.0.1:9100';
++
++/**
++ * Shared cast state. `Vue.observable` keeps it reactive without adding a Vuex
++ * module, so the player-bar button and the device panel stay in sync.
++ */
++export const castState = Vue.observable({
++  open: false, // panel visible
++  ready: false, // daemon answered at least once
++  devices: [], // device list
++  selected: [], // device ids currently driven
++  auto: false, // follow the player and push every new track
++  nativeSync: false, // true => the protocol groups the devices itself (HEOS)
++  quality: 'lossless', // standard | exhigh | lossless | hires
++  // false => the renderer pulls from our gateway on this machine.
++  // true  => the renderer pulls straight from the NetEase CDN. Flip this when
++  //          the renderer cannot reach this PC (firewall / 360 LAN stealth /
++  //          router AP isolation): everything succeeds but nothing plays.
++  direct: false,
++  error: '',
++  active: {}, // id -> playing
++});
++
++async function call(path, options = {}) {
++  const res = await fetch(`${BASE}${path}`, {
++    headers: { 'Content-Type': 'application/json' },
++    ...options,
++  });
++  const json = await res.json();
++  if (!json.ok) throw new Error(json.error || `cast: ${path} failed`);
++  castState.ready = true;
++  return json.data;
++}
++
++const post = (path, body) =>
++  call(path, { method: 'POST', body: JSON.stringify(body) });
++
++// ---------------------------------------------------------------- devices
++
++/** One discovery sweep. Returns `{ added, lost }`. */
++export const refresh = async () => {
++  const r = await post('/api/refresh');
++  castState.devices = await call('/api/devices');
++  castState.error = '';
++  return r;
++};
++
++export const devices = () => call('/api/devices');
++export const connect = id => post('/api/connect', { id });
++export const disconnect = id => post('/api/disconnect', { id });
++
++// --------------------------------------------------------------- playback
++
++/**
++ * Push one track to one or more devices.
++ * `track` is a cast-engine Track: { id, title, artist, album, duration_ms, cover, quality }
++ */
++export const play = (ids, track) => post('/api/play', { ids, track, direct: castState.direct });
++
++/** Push a queue; the daemon advances automatically on end-of-track. */
++export const playQueue = (ids, tracks) =>
++  post('/api/queue', { ids, tracks, direct: castState.direct });
++
++/**
++ * Switch how renderers get their audio.
++ * `false` (default) — they fetch from our gateway, which gives a stable MIME
++ * type, a real Content-Length, working Range, and works for tracks that need a
++ * cookie. `true` — they fetch the NetEase CDN URL directly, which needs no
++ * inbound connection to this machine at all.
++ */
++export async function setDirect(on) {
++  castState.direct = await post('/api/direct', { direct: !!on });
++  return castState.direct;
++}
++
++/** Daemon info: LAN address, port, delivery mode. */
++export const info = () => call('/api/info');
++
++export const next = ids => post('/api/next', { ids });
++export const pause = id => post('/api/pause', { id });
++export const resume = id => post('/api/resume', { id });
++export const stop = id => post('/api/stop', { id });
++export const volume = (id, v) => post('/api/volume', { id, volume: v });
++export const mute = (id, m) => post('/api/mute', { id, muted: m });
++export const status = id => call(`/api/status?id=${encodeURIComponent(id)}`);
++
++// ----------------------------------------------------------------- groups
++
++/**
++ * Put several devices into one synchronised group.
++ * Returns true when the protocol groups them natively (HEOS); otherwise the
++ * daemon runs software drift correction.
++ */
++export const group = async ids => {
++  castState.nativeSync = await post('/api/group', { ids });
++  return castState.nativeSync;
++};
++export const ungroup = () => post('/api/ungroup');
++
++// ---------------------------------------------------------------- NetEase
++
++export const qrLogin = () => call('/api/netease/qr');
++export const qrPoll = key => call(`/api/netease/qr/poll?key=${key}`);
++export const myPlaylists = () => call('/api/netease/playlists');
++export const playlistTracks = (id, quality = castState.quality) =>
++  call(`/api/netease/playlist?id=${id}&quality=${quality}`);
++export const search = (kw, limit = 30) =>
++  call(`/api/netease/search?kw=${encodeURIComponent(kw)}&limit=${limit}`);
++export const setCookie = cookie => post('/api/netease/cookie', { cookie });
++
++/**
++ * Hand the daemon the login YesPlayMusic already has.
++ *
++ * YPM keeps each NetEase cookie under `localStorage['cookie-<name>']`
++ * (see `src/utils/auth.js`). The daemon needs the raw `MUSIC_U` / `__csrf`
++ * pair, and `os=pc` so the `/api/...` endpoints answer as the PC client.
++ */
++export function pushCookie() {
++  const parts = [];
++  for (let i = 0; i < localStorage.length; i++) {
++    const key = localStorage.key(i);
++    if (!key || !key.startsWith('cookie-')) continue;
++    const value = localStorage.getItem(key);
++    if (!value) continue;
++    parts.push(`${key.slice('cookie-'.length)}=${value}`);
++  }
++  if (!parts.some(p => p.startsWith('MUSIC_U='))) return Promise.resolve(false);
++  parts.push('os=pc');
++  return setCookie(parts.join('; ')).then(() => true);
++}
++
++// ------------------------------------------------------------------ model
++
++/** Convert a YesPlayMusic track object into a cast-engine Track. */
++export function toTrack(t, quality = castState.quality) {
++  return {
++    id: Number(t.id),
++    title: t.name || '',
++    artist: (t.ar || t.artists || []).map(a => a.name).join(', '),
++    album: (t.al || t.album || {}).name || '',
++    duration_ms: t.dt || t.duration || 0,
++    cover: (t.al || t.album || {}).picUrl || null,
++    quality,
++  };
++}
++
++// ------------------------------------------------------------------ events
++
++/**
++ * Subscribe to the engine event bus.
++ * Long-polls `GET /api/events` and invokes `onEvent(e)` for each one.
++ * Returns a `stop()` function.
++ */
++export function subscribe(onEvent, onError = () => {}) {
++  let cursor = 0;
++  let alive = true;
++  (async () => {
++    while (alive) {
++      try {
++        const res = await fetch(`${BASE}/api/events?cursor=${cursor}`);
++        const json = await res.json();
++        if (json.ok) {
++          cursor = json.data.cursor;
++          (json.data.events || []).forEach(onEvent);
++        }
++      } catch (e) {
++        onError(e);
++        await new Promise(r => setTimeout(r, 2000));
++      }
++    }
++  })();
++  return () => {
++    alive = false;
++  };
++}
++
++const LABELS = { upnp: 'DLNA', heos: 'HEOS', airplay: 'AirPlay', qplay: 'QPlay' };
++export const protoLabel = p => LABELS[p] || p;
+diff --git a/vue.config.js b/vue.config.js
+index bbbc54e..93c9319 100644
+--- a/vue.config.js
++++ b/vue.config.js
+@@ -104,6 +104,15 @@ module.exports = {
+         directories: {
+           output: 'dist_electron',
+         },
++        // Ship the push daemon next to the app: it is a real binary, so it has
++        // to live outside the asar archive. Put ncm-castd(.exe) in ./bin first.
++        extraResources: [
++          {
++            from: 'bin',
++            to: '.',
++            filter: ['ncm-castd*', '*.dll'],
++          },
++        ],
+         mac: {
+           target: [
+             {

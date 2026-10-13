@@ -1,0 +1,31 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Debug / run logs produced while developing against a real speaker
+*.log
+run/
+
+# Local builds of ncm-castd. These are per-platform binaries (~4 MB each) and
+# are produced by `cargo build --release`; distribute them through releases or
+# the packaging step instead.
+dist/
+dist2/
+final/
+v/
+v2/
+v3/
+v4/
+v5/
+v6/
+**/*.exe
+**/*.dll
+**/*.so
+**/*.dylib
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
